@@ -1,0 +1,13 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    # Map host port 3000 to the container port, which is controlled by PORT
+    ports:
+      - "3000:${PORT}"
+    environment:
+      - PORT=${PORT}
+    env_file:
+      - .env
+    restart: unless-stopped

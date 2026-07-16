@@ -1,0 +1,114 @@
+name: CI/CD Pipeline
+
+# Run this pipeline on every push to main
+on:
+  push:
+    branches: [main]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # ---------- STEP 1: TEST ----------
+  test:
+    name: Run tests
+    runs-on: ubuntu-latest
+    steps:
+      # Check out the repository code so later steps can access it
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Install the Node.js version the app is built for
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: app/package-lock.json
+
+      # Install dependencies exactly as locked in package-lock.json
+      - name: Install dependencies
+        working-directory: ./app
+        run: npm ci
+
+      # Run the automated test suite. If this fails, the whole
+      # pipeline stops here and nothing gets built or deployed.
+      - name: Run tests
+        working-directory: ./app
+        run: npm test
+
+  # ---------- STEP 2 & 3: BUILD + PUSH ----------
+  build-and-push:
+    name: Build and push Docker image
+    needs: test # only runs if the test job succeeded
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write # needed to push to GitHub Container Registry
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Authenticate to GitHub Container Registry using the
+      # automatically-provided GITHUB_TOKEN (no manual secret needed for this step)
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Build the Docker image and tag it two ways:
+      # one immutable tag with the exact commit SHA, and one "latest" tag
+      - name: Build Docker image
+        run: |
+          docker build \
+            -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }} \
+            -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest \
+            .
+
+      # Push both tags to the registry
+      - name: Push Docker image
+        run: |
+          docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+
+  # ---------- STEP 4: DEPLOY ----------
+  deploy:
+    name: Deploy to the server
+    needs: build-and-push # only runs if the build/push job succeeded
+    runs-on: ubuntu-latest
+    steps:
+      # SSH into the EC2 server and tell it to pull + run the new image.
+      # SERVER_HOST, SERVER_USER, SERVER_SSH_KEY and GHCR_TOKEN are all
+      # stored as encrypted GitHub repository secrets, never in this file.
+      - name: Deploy over SSH
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          script: |
+            # Log in to GHCR from the server so it's allowed to pull the image
+            echo "${{ secrets.GHCR_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+            # Pull the image that was just built and pushed
+            docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+
+            # Stop and remove the currently running container, if any
+            docker stop deployready-app || true
+            docker rm deployready-app || true
+
+            # Start the new container: host port 80 -> container port 3000,
+            # auto-restart if the server reboots or the process crashes
+            docker run -d \
+              --name deployready-app \
+              -p 80:3000 \
+              -e PORT=3000 \
+              --restart unless-stopped \
+              ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+
+            # Quick sanity check that the container is actually up
+            sleep 3
+            curl -f http://localhost:80/health
