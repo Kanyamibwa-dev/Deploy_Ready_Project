@@ -1,95 +1,131 @@
 name: CI/CD Pipeline
 
-# Run this pipeline on every push to main
 on:
   push:
-    branches: [main]
+    branches:
+      - main
 
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
 
+
 jobs:
-  # ---------- STEP 1: TEST ----------
+
+  # -----------------------------
+  # TEST
+  # -----------------------------
   test:
-    name: Run tests
+    name: Run Tests
     runs-on: ubuntu-latest
+
     steps:
-      # Check out the repository code so later steps can access it
+
+      # Download repository code
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # Install the Node.js version the app is built for
-      - name: Set up Node.js
+
+      # Install Node.js
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
-          cache: 'npm'
+          node-version: 20
+          cache: npm
           cache-dependency-path: app/package-lock.json
 
-      # Install dependencies exactly as locked in package-lock.json
+
+      # Install dependencies
       - name: Install dependencies
         working-directory: ./app
         run: npm ci
 
-      # Run the automated test suite. If this fails, the whole
-      # pipeline stops here and nothing gets built or deployed.
+
+      # Run application tests
       - name: Run tests
         working-directory: ./app
         run: npm test
 
-  # ---------- STEP 2 & 3: BUILD + PUSH ----------
+
+
+  # -----------------------------
+  # BUILD AND PUSH IMAGE
+  # -----------------------------
   build-and-push:
-    name: Build and push Docker image
-    needs: test # only runs if the test job succeeded
+
+    name: Build and Push Docker Image
+
+    needs: test
+
     runs-on: ubuntu-latest
+
     permissions:
       contents: read
-      packages: write # needed to push to GitHub Container Registry
+      packages: write
+
+
     steps:
+
+      # Download repository code
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # Authenticate to GitHub Container Registry using the
-      # automatically-provided GITHUB_TOKEN (no manual secret needed for this step)
-      - name: Log in to GitHub Container Registry
+
+
+      # Login to GitHub Container Registry
+      - name: Login to GHCR
         uses: docker/login-action@v3
         with:
-          registry: ${{ env.REGISTRY }}
+          registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Build the Docker image and tag it two ways:
-      # one immutable tag with the exact commit SHA, and one "latest" tag
+
+
+      # Create Docker image metadata
+      - name: Generate Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+
+
+
+      # Build Docker image
       - name: Build Docker image
-        run: |
-          docker build \
-            -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }} \
-            -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest \
-            .
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          tags: ${{ steps.meta.outputs.tags }}
 
-      # Push both tags to the registry
+
+
+      # Push Docker image to GHCR
       - name: Push Docker image
-        run: |
-          docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
-          docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
 
-  # ---------- STEP 4: DEPLOY ----------
+
+
+  # -----------------------------
+  # DEPLOY TO RENDER
+  # -----------------------------
   deploy:
-    name: Deploy to Render
-    needs: build-and-push # only runs if the build/push job succeeded
-    runs-on: ubuntu-latest
-    steps:
-      # Render watches its own deploy hook URL: hitting it tells Render
-      # to pull the latest image from GHCR and restart the service.
-      # RENDER_DEPLOY_HOOK is stored as an encrypted GitHub repository
-      # secret, never in this file.
-      - name: Trigger Render deploy
-        run: curl -f "${{ secrets.RENDER_DEPLOY_HOOK }}"
 
-      # Give Render a little time to pull the image and restart,
-      # then confirm the live service actually responds
-      - name: Verify health endpoint
-        run: |
-          sleep 30
-          curl -f ${{ secrets.RENDER_SERVICE_URL }}/health
+    name: Deploy to Render
+
+    needs: build-and-push
+
+    runs-on: ubuntu-latest
+
+
+    steps:
+
+      # Tell Render to deploy the latest version
+      - name: Trigger Render deployment
+        run: curl "${{ secrets.RENDER_DEPLOY_HOOK }}"
+        
